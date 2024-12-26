@@ -1,9 +1,11 @@
 #![allow(unused)]
 use async_trait::async_trait;
+use client::{Msg, Session};
 use russh::*;
 use russh_keys::ssh_key;
 use russh_keys::HashAlg::Sha512;
 use russh_keys::{decode_secret_key, key::PrivateKeyWithHashAlg};
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
@@ -73,27 +75,45 @@ impl russh::client::Handler for CliHandler {
     }
 }
 
+#[allow(private_interfaces)]
 pub struct SshClient {
     pub config: SshConfig,
-    pub session: Option<client::Session>,
+    pub session: client::Handle<CliHandler>,
+    pub channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
 impl SshClient {
-    pub fn new(config: &SshConfig) -> Result<Self, String> {
+    pub async fn new(config: &SshConfig) -> Result<Self, String> {
         SshConfig::validate_config(&config)?;
+        let ssh_conf = Arc::new(client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(5)),
+            ..<_>::default()
+        });
+
+        let mut session: client::Handle<_> = match client::connect(
+            ssh_conf,
+            (config.hostname.clone(), config.port),
+            CliHandler {},
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => return Err(format!("Failed to connect: {}", e)),
+        };
+
         Ok(Self {
             config: config.clone(),
-            session: None,
+            session: session,
+            channels: HashMap::new(),
         })
     }
 
     async fn authenticate_with_password(
-        &self,
-        session: &mut client::Handle<CliHandler>,
+        &mut self,
         username: &str,
         password: &str,
     ) -> Result<(), String> {
-        session
+        self.session
             .authenticate_password(username, password.to_string())
             .await
             .map_err(|e| format!("Password authentication failed: {}", e))?;
@@ -102,8 +122,7 @@ impl SshClient {
     }
 
     async fn authenticate_with_publick_key(
-        &self,
-        session: &mut client::Handle<CliHandler>,
+        &mut self,
         username: &str,
         key: &str,
         passphrase: &Option<String>,
@@ -113,11 +132,30 @@ impl SshClient {
         let private_key_with_hash_alg =
             PrivateKeyWithHashAlg::new(Arc::new(key_pair), Some(Sha512))
                 .map_err(|e| format!("Failed to create private key with hash algorithm: {}", e))?;
-        session
+        self.session
             .authenticate_publickey(username, private_key_with_hash_alg)
             .await
             .map_err(|e| format!("Private key authentication failed: {}", e))?;
         println!("Private key authentication successful.");
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> Result<(), String> {
+        self.session
+            .disconnect(Disconnect::ByApplication, "", "en")
+            .await
+            .map_err(|e| format!("Failed to disconnect: {}", e))?;
+        Ok(())
+    }
+
+    pub async fn open_session_channel(&mut self) -> Result<(), String> {
+        let mut channel = self
+            .session
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Failed to disconnect: {}", e))?;
+
+        self.channels.insert(channel.id(), channel);
         Ok(())
     }
 
@@ -126,32 +164,21 @@ impl SshClient {
         let port = self.config.port;
         let username = self.config.username.clone().unwrap_or("root".to_string());
 
-        let config = client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(5)),
-            ..<_>::default()
-        };
-
-        let config = Arc::new(config);
-        let handler = CliHandler {};
-        let mut session: client::Handle<_> =
-            match client::connect(config, (host, port), handler).await {
-                Ok(session) => session,
-                Err(e) => return Err(format!("Failed to connect: {}", e)),
-            };
-
-        match &self.config.auth_method {
+        let auth_method = self.config.auth_method.clone();
+        match auth_method {
             AuthMethod::Password(password) => {
-                self.authenticate_with_password(&mut session, &username, password)
+                self.authenticate_with_password(&username, &password)
                     .await?;
             }
             AuthMethod::PrivateKey { key, passphrase } => {
-                self.authenticate_with_publick_key(&mut session, &username, key, passphrase)
+                self.authenticate_with_publick_key(&username, &key, &passphrase)
                     .await?;
             }
             _ => {
                 return Err("Unsupported authentication method.".to_string());
             }
         }
+
         Ok(())
     }
 }
@@ -168,7 +195,7 @@ async fn test_ssh_client_connect_password_auth() {
         win_height: 24,
     };
 
-    let mut client = match SshClient::new(&config) {
+    let mut client = match SshClient::new(&config).await {
         Ok(client) => client,
         Err(e) => {
             panic!("Failed to create SSH client: {}", e);
@@ -181,7 +208,8 @@ async fn test_ssh_client_connect_password_auth() {
 
 #[tokio::test]
 async fn test_ssh_client_connect_private_key_auth() {
-    let private_key_path = "/Users/ryan/.ssh/id_rsa";
+    // 确保私钥文件路径正确
+    let private_key_path = "/Users/ryan/.ssh/id_rsa"; // 这里替换为实际路径
     let private_key_content = match fs::read_to_string(private_key_path) {
         Ok(content) => content,
         Err(e) => panic!(
@@ -203,7 +231,7 @@ async fn test_ssh_client_connect_private_key_auth() {
         win_height: 24,
     };
 
-    let mut client = match SshClient::new(&config) {
+    let mut client = match SshClient::new(&config).await {
         Ok(client) => client,
         Err(e) => {
             panic!("Failed to create SSH client: {}", e);
